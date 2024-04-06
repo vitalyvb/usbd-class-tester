@@ -67,7 +67,7 @@ Check crate tests directory for more examples.
 
 Also see the documentation for `usb-device`.
 
-```
+```rust
 use usb_device::class_prelude::*;
 use usbd_class_tester::prelude::*;
 
