@@ -1,0 +1,898 @@
+#![allow(clippy::test_attr_in_doctest)]
+//!
+//! A library for running tests of `usb-device` classes on
+//! developer's system natively.
+//!
+//! ## About
+//!
+//! Testing is difficult, and if it's even more difficult
+//! when it involves a dedicated hardware and doing
+//! the test manually. Often a lot of stuff needs to be
+//! re-tested even after small code changes.
+//!
+//! This library aims to help testing the implementation of
+//! protocols in USB devices which are based on `usb-device`
+//! crate by providing a means of simulating Host's accesses
+//! to the device.
+//!
+//! Initial implementation was done for tests in `usbd-dfu`
+//! crate. This library is based on that idea, but extends
+//! it a lot. For example it adds a set of convenience
+//! functions for Control transfers, while originally this
+//! was done via plain `u8` arrays only.
+//!
+//! ### Supported operations
+//!
+//! * IN and OUT EP0 control transfers
+//!
+//! ### Not supported operations
+//!
+//! Almost everything else, including but not limited to:
+//!
+//! * Endpoints other than EP0 in `EmulatedUsbBus::poll()`
+//! * Endpoint allocation in `EmulatedUsbBus::alloc_ep()`
+//! * Reset
+//! * Suspend and Resume
+//! * Interrupt transfers
+//! * Bulk transfers
+//! * Iso transfers
+//! * ...
+//!
+//! ## License
+//!
+//! This project is licensed under [MIT License](https://opensource.org/licenses/MIT)
+//! ([LICENSE](https://github.com/vitalyvb/usbd-class-tester/blob/main/LICENSE)).
+//!
+//! ### Contribution
+//!
+//! Unless you explicitly state otherwise, any contribution intentionally
+//! submitted for inclusion in the work by you shall be licensed as above,
+//! without any additional terms or conditions.
+//!
+//! ## Example
+//!
+//! The example defines an empty `UsbClass` implementation for `TestUsbClass`.
+//! Normally this would also include things like endpoint allocations,
+//! device-specific descriptor generation, and the code handling everything.
+//! This is not in the scope of this example.
+//!
+//! A minimal `TestCtx` creates `TestUsbClass` that will be passed to
+//! a test case. In general, `TestCtx` allows some degree of environment
+//! customization, like choosing EP0 transfer size, or redefining how
+//! `UsbDevice` is created.
+//!
+//! Check crate tests directory for more examples.
+//!
+//! Also see the documentation for `usb-device`.
+//!
+//! ```
+//! use usb_device::class_prelude::*;
+//! use usbd_class_tester::prelude::*;
+//!
+//! // `UsbClass` under the test.
+//! pub struct TestUsbClass {}
+//! impl<B: UsbBus> UsbClass<B> for TestUsbClass {}
+//!
+//! // Context to create a testable instance of `TestUsbClass`
+//! struct TestCtx {}
+//! impl UsbDeviceCtx<EmulatedUsbBus, TestUsbClass> for TestCtx {
+//!     fn create_class<'a>(
+//!         &mut self,
+//!         alloc: &'a UsbBusAllocator<EmulatedUsbBus>,
+//!     ) -> AnyResult<TestUsbClass> {
+//!         Ok(TestUsbClass {})
+//!     }
+//! }
+//!
+//! #[test]
+//! fn test_interface_get_status() {
+//!     with_usb(TestCtx {}, |mut cls, mut dev| {
+//!         let st = dev.interface_get_status(&mut cls, 0).expect("status");
+//!         assert_eq!(st, 0);
+//!     })
+//!     .expect("with_usb");
+//! }
+//! ```
+//!
+
+use std::fmt::Debug;
+use std::marker::PhantomData;
+use std::{cell::RefCell, rc::Rc};
+
+use usb_device::bus::{UsbBus, UsbBusAllocator};
+use usb_device::class::UsbClass;
+use usb_device::device::{StringDescriptors, UsbDevice, UsbDeviceBuilder, UsbVidPid};
+use usb_device::endpoint::EndpointAddress;
+use usb_device::prelude::BuilderError;
+use usb_device::UsbDirection;
+
+mod bus;
+use bus::*;
+
+mod usbdata;
+use usbdata::*;
+
+pub mod prelude {
+    pub use crate::bus::EmulatedUsbBus;
+    pub use crate::usbdata::{CtrRequestType, SetupPacket};
+    pub use crate::{with_usb, AnyResult, AnyUsbError, Device, UsbDeviceCtx};
+}
+
+const DEFAULT_EP0_SIZE: u8 = 8;
+const DEFAULT_ADDRESS: u8 = 5;
+
+/// Possible errors or other abnormal
+/// conditions.
+#[derive(Debug, PartialEq)]
+pub enum AnyUsbError {
+    /// EP0 Stalled. Not necessarily an error,
+    /// the Device rejected EP0 transaction.
+    /// Next request should clear Stall for EP0.
+    EP0Stalled,
+    /// Error while reading from EP0.
+    /// No data or data limit reached.
+    /// Usually, this is some internal error.
+    EP0ReadFailed,
+    /// Bad reply length for GET_STATUS control request.
+    /// Length should be 2.
+    /// Usually, this is some internal error.
+    EP0BadGetStatusSize,
+    /// Bad reply length for GET_CONFIGURATION control request.
+    /// Length should be 1.
+    /// Usually, this is some internal error.
+    EP0BadGetConfigSize,
+    /// Failed to convert one data representation
+    /// to another, e.g. with TryInto.
+    /// Usually, this is some internal error.
+    DataConversion,
+    /// SET_ADDRESS didn't work during Device setup.
+    /// Usually, this is some internal error.
+    SetAddressFailed,
+    ///
+    InvalidDescriptorLength,
+    ///
+    InvalidDescriptorType,
+    ///
+    InvalidStringLength,
+    /// Wrapper for `BuilderError` of `usb-device`
+    /// when `UsbDeviceBuilder` fails.
+    UsbDeviceBuilder(BuilderError),
+    /// User-defined meaning.
+    /// Enum value is passed through, not used by the library.
+    UserDefined1,
+    /// User-defined meaning
+    /// Enum value is passed through, not used by the library.
+    UserDefined2,
+    /// User-defined meaning
+    /// Enum value is passed through, not used by the library.
+    UserDefinedU64(u64),
+    /// User-defined meaning
+    /// Enum value is passed through, not used by the library.
+    UserDefinedString(String),
+}
+
+pub type AnyResult<T> = core::result::Result<T, AnyUsbError>;
+
+/// A context for the test, provides some
+/// configuration values, initialization,
+/// and some customization.
+pub trait UsbDeviceCtx<B: UsbBus, C: UsbClass<B>> {
+    /// EP0 size used by `build_usb_device()` when creating
+    /// `UsbDevice`.
+    ///
+    /// Incorrect values should cause `UsbDeviceBuilder` to
+    /// fail.
+    const EP0_SIZE: u8 = DEFAULT_EP0_SIZE;
+
+    /// Address the Device gets assigned.
+    ///
+    /// A properly configured Device should get
+    /// a non-zero address.
+    const ADDRESS: u8 = DEFAULT_ADDRESS;
+
+    /// Create `UsbClass` object.
+    /// # Example
+    /// ```
+    /// # use usb_device::class_prelude::*;
+    /// # use usbd_class_tester::prelude::*;
+    /// # struct TestUsbClass {}
+    /// # impl TestUsbClass {
+    /// #     pub fn new<B: UsbBus>(_alloc: &UsbBusAllocator<B>) -> Self {Self {}}
+    /// # }
+    /// # trait DOC<B: UsbBus> {
+    /// fn create_class<'a>(
+    ///     &mut self,
+    ///     alloc: &'a UsbBusAllocator<EmulatedUsbBus>,
+    /// ) -> AnyResult<TestUsbClass> {
+    ///     Ok(TestUsbClass::new(&alloc))
+    /// }
+    /// # }
+    /// ```
+    fn create_class(&mut self, alloc: &UsbBusAllocator<B>) -> AnyResult<C>;
+
+    /// Optional. Called after each `usb-device` `poll()`.
+    ///
+    /// Default implementation does nothing.
+    fn post_poll(&mut self, _cls: &mut C) {}
+
+    /// Optional. If returns `true`, `Device::setup()` is not
+    /// called to initialize and enumerate device in
+    /// `with_usb()`.
+    ///
+    /// `with_usb()`'s `case` will be called with a
+    /// non-configured/non-enumerated device.
+    ///
+    /// Default implementation always returns `false`.
+    fn skip_setup(&mut self) -> bool {
+        false
+    }
+
+    /// Optional. Implementation overrides the creation of `UsbDevice`
+    /// if the default implementation needs changing.
+    /// # Example
+    /// ```
+    /// # use usb_device::prelude::*;
+    /// # use usb_device::class_prelude::*;
+    /// # use usbd_class_tester::AnyResult;
+    /// # trait DOC<B: UsbBus> {
+    /// fn build_usb_device<'a>(&mut self, alloc: &'a UsbBusAllocator<B>) -> AnyResult<UsbDevice<'a, B>> {
+    ///     let usb_dev = UsbDeviceBuilder::new(alloc, UsbVidPid(0, 0))
+    ///      // .strings()
+    ///      // .max_packet_size_0()
+    ///      // ...
+    ///         .build();
+    ///     Ok(usb_dev)
+    /// }
+    /// # }
+    /// ````
+    fn build_usb_device<'a>(
+        &mut self,
+        alloc: &'a UsbBusAllocator<B>,
+    ) -> AnyResult<UsbDevice<'a, B>> {
+        let usb_dev = UsbDeviceBuilder::new(alloc, UsbVidPid(0x1234, 0x5678))
+            .strings(&[StringDescriptors::default()
+                .manufacturer("TestManufacturer")
+                .product("TestProduct")
+                .serial_number("TestSerial")])
+            .map_err(AnyUsbError::UsbDeviceBuilder)?
+            .device_release(0x0200)
+            .self_powered(true)
+            .max_power(250)
+            .map_err(AnyUsbError::UsbDeviceBuilder)?
+            .max_packet_size_0(Self::EP0_SIZE)
+            .map_err(AnyUsbError::UsbDeviceBuilder)?
+            .build();
+
+        Ok(usb_dev)
+    }
+}
+
+/// Represents Host's view of the Device via
+/// USB bus.
+pub struct Device<'a, C, X>
+where
+    C: UsbClass<EmulatedUsbBus>,
+    X: UsbDeviceCtx<EmulatedUsbBus, C>,
+{
+    ctx: X,
+    usb: &'a RefCell<UsbBusImpl>,
+    dev: UsbDevice<'a, EmulatedUsbBus>,
+    _cls: PhantomData<C>,
+}
+
+impl<'a, C, X> Device<'a, C, X>
+where
+    C: UsbClass<EmulatedUsbBus>,
+    X: UsbDeviceCtx<EmulatedUsbBus, C>,
+{
+    fn new(usb: &'a RefCell<UsbBusImpl>, ctx: X, dev: UsbDevice<'a, EmulatedUsbBus>) -> Self {
+        Device {
+            usb,
+            ctx,
+            dev,
+            _cls: PhantomData,
+        }
+    }
+
+    /// Provides direct access to `EmulatedUsbBus`
+    pub fn usb_dev(&mut self) -> &mut UsbDevice<'a, EmulatedUsbBus> {
+        &mut self.dev
+    }
+
+    /// Perform EP0 Control transfer. `setup` is `SetupPacket`.
+    /// If transfer is Host-to-device and
+    /// `data` is `Some`, then it's sent after the Setup packet
+    /// and Device can receive it as a payload. For Device-to-host
+    /// transfers `data` should be `None` and `out` must have
+    /// enough space to store the response.
+    pub fn ep0(
+        &mut self,
+        d: &mut C,
+        setup: SetupPacket,
+        data: Option<&[u8]>,
+        out: &mut [u8],
+    ) -> core::result::Result<usize, AnyUsbError> {
+        let setup_bytes: [u8; 8] = setup.into();
+        self.ep0_raw(d, &setup_bytes, data, out)
+    }
+
+    /// Perform raw EP0 Control transfer. `setup_bytes` is a
+    /// 8-byte Setup packet. If transfer is Host-to-device and
+    /// `data` is `Some`, then it's sent after the Setup packet
+    /// and Device can receive it as a payload. For Device-to-host
+    /// transfers `data` should be `None` and `out` must have
+    /// enough space to store the response.
+    pub fn ep0_raw(
+        &mut self,
+        d: &mut C,
+        setup_bytes: &[u8],
+        data: Option<&[u8]>,
+        out: &mut [u8],
+    ) -> core::result::Result<usize, AnyUsbError> {
+        let out0 = EndpointAddress::from_parts(0, UsbDirection::Out);
+        let in0 = EndpointAddress::from_parts(0, UsbDirection::In);
+
+        self.usb.borrow().set_read(out0, setup_bytes, true);
+        self.dev.poll(&mut [d]);
+        self.ctx.post_poll(d);
+        if self.usb.borrow().stalled0() {
+            return Err(AnyUsbError::EP0Stalled);
+        }
+
+        if let Some(val) = data {
+            self.usb.borrow().set_read(out0, val, false);
+            for i in 1..100 {
+                let res = self.dev.poll(&mut [d]);
+                self.ctx.post_poll(d);
+                if !res {
+                    break;
+                }
+                if i >= 99 {
+                    return Err(AnyUsbError::EP0ReadFailed);
+                }
+            }
+            if self.usb.borrow().stalled0() {
+                return Err(AnyUsbError::EP0Stalled);
+            }
+        };
+
+        let mut len = 0;
+
+        loop {
+            let one = self.usb.borrow().get_write(in0, &mut out[len..]);
+            self.dev.poll(&mut [d]);
+            self.ctx.post_poll(d);
+            if self.usb.borrow().stalled0() {
+                return Err(AnyUsbError::EP0Stalled);
+            }
+
+            len += one;
+            if one < DEFAULT_EP0_SIZE as usize {
+                // short read - last block
+                break;
+            }
+        }
+
+        Ok(len)
+    }
+
+    /// Perform EP0 Control transfer.
+    /// If transfer is Host-to-device and
+    /// `data` is `Some`, then it's sent after the Setup packet
+    /// and Device can receive it as a payload. For Device-to-host
+    /// transfers `data` should be `None` and the response
+    /// is returned in a result `Vec`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ep_io_control(
+        &mut self,
+        cls: &mut C,
+        reqt: CtrRequestType,
+        req: u8,
+        value: u16,
+        index: u16,
+        length: u16,
+        data: Option<&[u8]>,
+    ) -> core::result::Result<Vec<u8>, AnyUsbError> {
+        let mut buf: Vec<u8> = vec![0; length as usize];
+
+        let setup = SetupPacket::new(reqt, req, value, index, length);
+
+        let len = self.ep0(cls, setup, data, buf.as_mut_slice())?;
+        buf.truncate(len);
+        Ok(buf)
+    }
+
+    /// Perform Device-to-host EP0 Control transfer.
+    /// The response is returned in a result `Vec`.
+    ///
+    /// `reqt` is passed as is. It should be `to_host()`.
+    pub fn control_read(
+        &mut self,
+        cls: &mut C,
+        reqt: CtrRequestType,
+        req: u8,
+        value: u16,
+        index: u16,
+        length: u16,
+    ) -> core::result::Result<Vec<u8>, AnyUsbError> {
+        self.ep_io_control(cls, reqt, req, value, index, length, None)
+    }
+
+    /// Perform Host-to-device EP0 Control transfer.
+    /// `data` is sent after the Setup packet
+    /// and Device can receive it as a payload.
+    /// The response is returned in a result `Vec`
+    /// and normally it should be empty.
+    ///
+    /// `reqt` is passed as is. It should be `to_device()`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn control_write(
+        &mut self,
+        cls: &mut C,
+        reqt: CtrRequestType,
+        req: u8,
+        value: u16,
+        index: u16,
+        length: u16,
+        data: &[u8],
+    ) -> core::result::Result<Vec<u8>, AnyUsbError> {
+        self.ep_io_control(cls, reqt, req, value, index, length, Some(data))
+    }
+
+    /// Standard Device Request: GET_STATUS (0x00)
+    pub fn device_get_status(&mut self, cls: &mut C) -> core::result::Result<u16, AnyUsbError> {
+        let data = self.control_read(cls, CtrRequestType::to_host(), 0, 0, 0, 2)?;
+        if data.len() != 2 {
+            return Err(AnyUsbError::EP0BadGetStatusSize);
+        }
+
+        let res = data.try_into().map_err(|_| AnyUsbError::DataConversion)?;
+        Ok(u16::from_le_bytes(res))
+    }
+
+    /// Standard Device Request: CLEAR_FEATURE (0x01)
+    pub fn device_clear_feature(
+        &mut self,
+        cls: &mut C,
+        feature: u16,
+    ) -> core::result::Result<(), AnyUsbError> {
+        self.control_write(cls, CtrRequestType::to_device(), 1, feature, 0, 0, &[])
+            .and(Ok(()))
+    }
+
+    /// Standard Device Request: SET_FEATURE (0x03)
+    pub fn device_set_feature(
+        &mut self,
+        cls: &mut C,
+        feature: u16,
+    ) -> core::result::Result<(), AnyUsbError> {
+        self.control_write(cls, CtrRequestType::to_device(), 3, feature, 0, 0, &[])
+            .and(Ok(()))
+    }
+
+    /// Standard Device Request: SET_ADDRESS (0x05)
+    pub fn device_set_address(
+        &mut self,
+        cls: &mut C,
+        address: u8,
+    ) -> core::result::Result<(), AnyUsbError> {
+        self.control_write(
+            cls,
+            CtrRequestType::to_device(),
+            5,
+            address as u16,
+            0,
+            0,
+            &[],
+        )
+        .and(Ok(()))
+    }
+
+    /// Standard Device Request: GET_DESCRIPTOR (0x06)
+    pub fn device_get_descriptor(
+        &mut self,
+        cls: &mut C,
+        dtype: u8,
+        dindex: u8,
+        lang_id: u16,
+        length: u16,
+    ) -> core::result::Result<Vec<u8>, AnyUsbError> {
+        let typeindex: u16 = ((dtype as u16) << 8) | dindex as u16;
+        self.control_read(
+            cls,
+            CtrRequestType::to_host(),
+            6,
+            typeindex,
+            lang_id,
+            length,
+        )
+    }
+
+    /// Get String descriptor from the device and return
+    /// unicode string.
+    ///
+    /// Standard Device Request: GET_DESCRIPTOR (0x06)
+    pub fn device_get_string(
+        &mut self,
+        cls: &mut C,
+        index: u8,
+        lang_id: u16,
+    ) -> core::result::Result<String, AnyUsbError> {
+        let typeindex: u16 = (3u16 << 8) | index as u16;
+        let descr =
+            self.control_read(cls, CtrRequestType::to_host(), 6, typeindex, lang_id, 255)?;
+
+        if descr.len() < 2 {
+            return Err(AnyUsbError::InvalidDescriptorLength);
+        }
+
+        if descr[0] as usize != descr.len() {
+            return Err(AnyUsbError::InvalidDescriptorLength);
+        }
+
+        if descr[1] != 3 {
+            return Err(AnyUsbError::InvalidDescriptorType);
+        }
+
+        if descr[0] % 2 != 0 {
+            return Err(AnyUsbError::InvalidStringLength);
+        }
+
+        let vu16: Vec<u16> = descr[2..]
+            .chunks(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let res = String::from_utf16(&vu16).map_err(|_| AnyUsbError::DataConversion)?;
+
+        Ok(res)
+    }
+
+    /// Standard Device Request: SET_DESCRIPTOR (0x07)
+    pub fn device_set_descriptor(
+        &mut self,
+        cls: &mut C,
+        dtype: u8,
+        dindex: u8,
+        lang_id: u16,
+        length: u16,
+        data: &[u8],
+    ) -> core::result::Result<(), AnyUsbError> {
+        let typeindex: u16 = ((dtype as u16) << 8) | dindex as u16;
+        self.control_write(
+            cls,
+            CtrRequestType::to_device(),
+            7,
+            typeindex,
+            lang_id,
+            length,
+            data,
+        )
+        .and(Ok(()))
+    }
+
+    /// Standard Device Request: GET_CONFIGURATION (0x08)
+    pub fn device_get_configuration(
+        &mut self,
+        cls: &mut C,
+    ) -> core::result::Result<u8, AnyUsbError> {
+        let res = self.control_read(cls, CtrRequestType::to_host(), 8, 0, 0, 1)?;
+        if res.len() != 1 {
+            return Err(AnyUsbError::EP0BadGetConfigSize);
+        }
+        Ok(res[0])
+    }
+
+    /// Standard Device Request: SET_CONFIGURATION (0x09)
+    pub fn device_set_configuration(
+        &mut self,
+        cls: &mut C,
+        configuration: u8,
+    ) -> core::result::Result<(), AnyUsbError> {
+        self.control_write(
+            cls,
+            CtrRequestType::to_device(),
+            9,
+            configuration as u16,
+            0,
+            0,
+            &[],
+        )
+        .and(Ok(()))
+    }
+
+    /// Standard Interface Request: GET_STATUS (0x00)
+    pub fn interface_get_status(
+        &mut self,
+        cls: &mut C,
+        interface: u8,
+    ) -> core::result::Result<u16, AnyUsbError> {
+        let data = self.control_read(
+            cls,
+            CtrRequestType::to_host().interface(),
+            0,
+            0,
+            interface as u16,
+            2,
+        )?;
+        if data.len() != 2 {
+            return Err(AnyUsbError::EP0BadGetStatusSize);
+        }
+
+        let res = data.try_into().map_err(|_| AnyUsbError::DataConversion)?;
+        Ok(u16::from_le_bytes(res))
+    }
+
+    /// Standard Interface Request: CLEAR_FEATURE (0x01)
+    pub fn interface_clear_feature(
+        &mut self,
+        cls: &mut C,
+        interface: u8,
+        feature: u16,
+    ) -> core::result::Result<(), AnyUsbError> {
+        self.control_write(
+            cls,
+            CtrRequestType::to_device().interface(),
+            1,
+            feature,
+            interface as u16,
+            0,
+            &[],
+        )
+        .and(Ok(()))
+    }
+
+    /// Standard Interface Request: SET_FEATURE (0x03)
+    pub fn interface_set_feature(
+        &mut self,
+        cls: &mut C,
+        interface: u8,
+        feature: u16,
+    ) -> core::result::Result<(), AnyUsbError> {
+        self.control_write(
+            cls,
+            CtrRequestType::to_device().interface(),
+            3,
+            feature,
+            interface as u16,
+            0,
+            &[],
+        )
+        .and(Ok(()))
+    }
+
+    /// Standard Interface Request: GET_INTERFACE (0x0a)
+    pub fn interface_get_interface(
+        &mut self,
+        cls: &mut C,
+    ) -> core::result::Result<u8, AnyUsbError> {
+        let res = self.control_read(cls, CtrRequestType::to_host().interface(), 10, 0, 0, 1)?;
+        if res.len() != 1 {
+            return Err(AnyUsbError::EP0BadGetConfigSize);
+        }
+        Ok(res[0])
+    }
+
+    /// Standard Interface Request: SET_INTERFACE (0x0b)
+    pub fn interface_set_interface(
+        &mut self,
+        cls: &mut C,
+        interface: u8,
+        alt_setting: u8,
+    ) -> core::result::Result<(), AnyUsbError> {
+        self.control_write(
+            cls,
+            CtrRequestType::to_device().interface(),
+            11,
+            alt_setting as u16,
+            interface as u16,
+            0,
+            &[],
+        )
+        .and(Ok(()))
+    }
+
+    /// Standard Endpoint Request: GET_STATUS (0x00)
+    pub fn endpoint_get_status(
+        &mut self,
+        cls: &mut C,
+        endpoint: u8,
+    ) -> core::result::Result<u16, AnyUsbError> {
+        let data = self.control_read(
+            cls,
+            CtrRequestType::to_host().endpoint(),
+            0,
+            0,
+            endpoint as u16,
+            2,
+        )?;
+        if data.len() != 2 {
+            return Err(AnyUsbError::EP0BadGetStatusSize);
+        }
+
+        let res = data.try_into().map_err(|_| AnyUsbError::DataConversion)?;
+        Ok(u16::from_le_bytes(res))
+    }
+
+    /// Standard Endpoint Request: CLEAR_FEATURE (0x01)
+    pub fn endpoint_clear_feature(
+        &mut self,
+        cls: &mut C,
+        endpoint: u8,
+        feature: u16,
+    ) -> core::result::Result<(), AnyUsbError> {
+        self.control_write(
+            cls,
+            CtrRequestType::to_device().endpoint(),
+            1,
+            feature,
+            endpoint as u16,
+            0,
+            &[],
+        )
+        .and(Ok(()))
+    }
+
+    /// Standard Endpoint Request: SET_FEATURE (0x03)
+    pub fn endpoint_set_feature(
+        &mut self,
+        cls: &mut C,
+        endpoint: u8,
+        feature: u16,
+    ) -> core::result::Result<(), AnyUsbError> {
+        self.control_write(
+            cls,
+            CtrRequestType::to_device().endpoint(),
+            3,
+            feature,
+            endpoint as u16,
+            0,
+            &[],
+        )
+        .and(Ok(()))
+    }
+
+    /// Standard Endpoint Request: SYNCH_FRAME (0x0c)
+    pub fn endpoint_synch_frame(
+        &mut self,
+        cls: &mut C,
+        endpoint: u8,
+    ) -> core::result::Result<u16, AnyUsbError> {
+        let data = self.control_read(
+            cls,
+            CtrRequestType::to_host().endpoint(),
+            12,
+            0,
+            endpoint as u16,
+            2,
+        )?;
+        if data.len() != 2 {
+            return Err(AnyUsbError::EP0BadGetStatusSize);
+        }
+
+        let res = data.try_into().map_err(|_| AnyUsbError::DataConversion)?;
+        Ok(u16::from_le_bytes(res))
+    }
+
+    /// Setup device approximately as Host would do.
+    ///
+    /// This gets some standard descriptors from the device
+    /// and performs standard configuration - sets
+    /// Device address and sets Device configuration
+    /// to `1`.
+    ///
+    /// This is performed automatically unless disabled
+    /// by `UsbDeviceCtx`.
+    ///
+    /// USB reset during enumeration is not performed.
+    pub fn setup(&mut self, cls: &mut C) -> core::result::Result<(), AnyUsbError> {
+        let mut vec;
+
+        // get device descriptor for max ep0 size
+        // we ignore result.
+        self.device_get_descriptor(cls, 1, 0, 0, 64)?;
+
+        // todo: reset device
+
+        // set address
+        self.device_set_address(cls, X::ADDRESS)?;
+        if self.dev.bus().get_address() != X::ADDRESS {
+            return Err(AnyUsbError::SetAddressFailed);
+        }
+
+        // get device descriptor again
+        let devd = self.device_get_descriptor(cls, 1, 0, 0, 18)?;
+
+        // get configuration descriptor for size
+        vec = self.device_get_descriptor(cls, 2, 0, 0, 9)?;
+        let conf_desc_len = u16::from_le_bytes([vec[2], vec[3]]);
+
+        // get configuration descriptor
+        // we ignore result.
+        self.device_get_descriptor(cls, 2, 0, 0, conf_desc_len)?;
+
+        // get string languages
+        vec = self.device_get_descriptor(cls, 3, 0, 0, 255)?;
+        let lang_id = u16::from_le_bytes([vec[2], vec[3]]);
+
+        // get string descriptors from device descriptor
+        for sid in devd[14..17].iter() {
+            if *sid != 0 {
+                self.device_get_descriptor(cls, 3, *sid, lang_id, 255)?;
+                //println!("========== {:?} {}", vec, sid);
+            }
+        }
+
+        // set configuration
+        self.device_set_configuration(cls, 1)?;
+
+        Ok(())
+    }
+}
+
+/// Initialize USB device Class `C` according to the provided
+/// context `X` and run `case()` on it.
+///
+/// `case` will not be called if `with_usb` encounters a
+/// problem during the setup, in this case `with_usb` returns
+/// an error.
+///
+/// # Example
+/// ```
+/// use usb_device::class_prelude::*;
+/// use usbd_class_tester::prelude::*;
+///
+/// pub struct TestUsbClass {}
+/// impl<B: UsbBus> UsbClass<B> for TestUsbClass {}
+///
+/// struct TestCtx {}
+/// impl TestCtx {}
+///
+/// impl UsbDeviceCtx<EmulatedUsbBus, TestUsbClass> for TestCtx {
+///     fn create_class<'a>(
+///         &mut self,
+///         alloc: &'a UsbBusAllocator<EmulatedUsbBus>,
+///     ) -> AnyResult<TestUsbClass> {
+///         Ok(TestUsbClass {})
+///     }
+/// }
+///
+/// #[test]
+/// fn test_interface_get_status() {
+///     with_usb(TestCtx {}, |mut cls, mut dev| {
+///         let st = dev.interface_get_status(&mut cls, 0).expect("status");
+///         assert_eq!(st, 0);
+///     })
+///     .expect("with_usb");
+/// }
+/// ```
+///
+pub fn with_usb<C, X>(mut ctx: X, case: for<'a> fn(cls: C, dev: Device<'a, C, X>)) -> AnyResult<()>
+where
+    C: UsbClass<EmulatedUsbBus>,
+    X: UsbDeviceCtx<EmulatedUsbBus, C>,
+{
+    let stio: UsbBusImpl = UsbBusImpl::new();
+    let io = Rc::new(RefCell::new(stio));
+    let bus = EmulatedUsbBus::new(&io);
+
+    let alloc: usb_device::bus::UsbBusAllocator<EmulatedUsbBus> = UsbBusAllocator::new(bus);
+
+    let mut cls = ctx.create_class(&alloc)?;
+
+    let mut usb_dev = ctx.build_usb_device(&alloc)?;
+
+    let skip_setup = ctx.skip_setup();
+
+    usb_dev.poll(&mut [&mut cls]);
+    ctx.post_poll(&mut cls);
+
+    let mut dev = Device::new(io.as_ref(), ctx, usb_dev);
+
+    if !skip_setup {
+        dev.setup(&mut cls)?;
+    }
+
+    // run test
+    case(cls, dev);
+    Ok(())
+}

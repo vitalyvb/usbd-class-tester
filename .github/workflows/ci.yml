@@ -1,0 +1,80 @@
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+name: Continuous integration
+
+jobs:
+
+  lints:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        rust:
+          - stable
+          - nightly
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - uses: dtolnay/rust-toolchain@master
+        id: toolchain
+        with:
+          toolchain: ${{ matrix.rust }}
+          components: rustfmt, clippy
+
+      - run: cargo +${{steps.toolchain.outputs.name}} fmt --all -- --check
+      - run: cargo +${{steps.toolchain.outputs.name}} clippy --all
+
+  build_only:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        rust:
+          - stable
+          - nightly
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - uses: dtolnay/rust-toolchain@master
+        id: toolchain
+        with:
+          toolchain: ${{ matrix.rust }}
+          targets: x86_64-unknown-linux-gnu
+
+      - run: cargo +${{steps.toolchain.outputs.name}} build --target x86_64-unknown-linux-gnu
+
+  tests:
+    needs: [build_only]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        rust:
+          - stable
+          - nightly
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Install 32-bit build dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y libc6-dev-i386
+
+      - uses: dtolnay/rust-toolchain@master
+        id: toolchain
+        with:
+          toolchain: ${{ matrix.rust }}
+          targets: "x86_64-unknown-linux-gnu,i686-unknown-linux-gnu"
+
+      - run: cargo +${{steps.toolchain.outputs.name}} build --target x86_64-unknown-linux-gnu
+      - run: cargo +${{steps.toolchain.outputs.name}} test --target x86_64-unknown-linux-gnu
+      - run: cargo +${{steps.toolchain.outputs.name}} doc --target x86_64-unknown-linux-gnu
+
+      - run: cargo clean
+
+      - run: cargo +${{steps.toolchain.outputs.name}} build --target i686-unknown-linux-gnu
+      - run: cargo +${{steps.toolchain.outputs.name}} test --target i686-unknown-linux-gnu

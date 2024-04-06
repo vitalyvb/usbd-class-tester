@@ -1,0 +1,17 @@
+[package]
+name = "usbd-class-tester"
+version = "0.1.0"
+edition = "2021"
+
+description = "Library for testing usb-device device classes."
+authors = ["Vitalii Bursov <vitaly@bursov.com>"]
+readme = "README.md"
+license = "MIT"
+keywords = ["usb-device", "embedded", "testing"]
+repository = "https://github.com/vitalyvb/usbd-class-tester"
+exclude = [
+    ".github",
+]
+
+[dependencies.usb-device]
+version = "0.3.2"
