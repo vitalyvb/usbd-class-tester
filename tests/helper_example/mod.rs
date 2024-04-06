@@ -1,8 +1,8 @@
 //! An example how to "extend"/add helper methods to
 //! `Device` by implementing a new trait for `Device`
 //! in a separate module.
-use usbd_class_tester::prelude::*;
 use usb_device::class::UsbClass;
+use usbd_class_tester::prelude::*;
 
 pub trait DeviceExt<T> {
     fn custom_get_status(&mut self, cls: &mut T) -> core::result::Result<Vec<u8>, AnyUsbError>;
