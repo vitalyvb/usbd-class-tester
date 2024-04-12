@@ -10,10 +10,12 @@ use usb_device::bus::PollResult;
 use usb_device::endpoint::{EndpointAddress, EndpointType};
 use usb_device::{Result as UsbDeviceResult, UsbDirection, UsbError};
 
+const NUM_ENDPOINTS: usize = 8;
+
 /// Holds a simulated Endpoint status which allows bi-directional
 /// communication via 1024 byte buffers.
 struct EndpointImpl {
-    alloc: bool,
+    ep_type: Option<EndpointType>,
     stall: bool,
     read_len: usize,
     read: [u8; 1024],
@@ -28,7 +30,7 @@ struct EndpointImpl {
 impl EndpointImpl {
     fn new() -> Self {
         EndpointImpl {
-            alloc: false,
+            ep_type: None,
             stall: false,
             read_len: 0,
             read: [0; 1024],
@@ -66,8 +68,8 @@ impl EndpointImpl {
 /// methods to access endpoint buffers like from
 /// the "Host" side.
 pub(crate) struct UsbBusImpl {
-    ep_i: [RefCell<EndpointImpl>; 4],
-    ep_o: [RefCell<EndpointImpl>; 4],
+    ep_i: [RefCell<EndpointImpl>; NUM_ENDPOINTS],
+    ep_o: [RefCell<EndpointImpl>; NUM_ENDPOINTS],
 }
 
 impl UsbBusImpl {
@@ -78,8 +80,16 @@ impl UsbBusImpl {
                 RefCell::new(EndpointImpl::new()),
                 RefCell::new(EndpointImpl::new()),
                 RefCell::new(EndpointImpl::new()),
+                RefCell::new(EndpointImpl::new()),
+                RefCell::new(EndpointImpl::new()),
+                RefCell::new(EndpointImpl::new()),
+                RefCell::new(EndpointImpl::new()),
             ],
             ep_o: [
+                RefCell::new(EndpointImpl::new()),
+                RefCell::new(EndpointImpl::new()),
+                RefCell::new(EndpointImpl::new()),
+                RefCell::new(EndpointImpl::new()),
                 RefCell::new(EndpointImpl::new()),
                 RefCell::new(EndpointImpl::new()),
                 RefCell::new(EndpointImpl::new()),
@@ -163,29 +173,37 @@ impl EmulatedUsbBus {
 impl usb_device::bus::UsbBus for EmulatedUsbBus {
     fn alloc_ep(
         &mut self,
-        _ep_dir: UsbDirection,
+        ep_dir: UsbDirection,
         ep_addr: Option<EndpointAddress>,
-        _ep_type: EndpointType,
+        ep_type: EndpointType,
         max_packet_size: u16,
         _interval: u8,
     ) -> UsbDeviceResult<EndpointAddress> {
-        if let Some(ea) = ep_addr {
+        for index in ep_addr.map(|a| a.index()..a.index() + 1).unwrap_or(1..NUM_ENDPOINTS) {
+            let found_addr = EndpointAddress::from_parts(index, ep_dir);
             let io = self.bus_ref().borrow();
-            let mut sep = io.epidx(ea).borrow_mut();
+            let mut ep = io.epidx(found_addr).borrow_mut();
 
-            if sep.alloc {
-                return Err(UsbError::InvalidEndpoint);
-            }
+            match ep.ep_type {
+                None => {
+                    ep.ep_type = Some(ep_type);
+                }
+                Some(t) if t != ep_type => {
+                    continue;
+                }
+                _ => {}
+            };
 
-            sep.alloc = true;
-            sep.stall = false;
-            sep.max_size = max_packet_size as usize;
+            ep.stall = false;
+            ep.max_size = max_packet_size as usize;
 
-            Ok(ea)
-        } else {
-            // ep_addr is required, endpoint allocation is not implemented
-            Err(UsbError::EndpointMemoryOverflow)
+            return Ok(found_addr);
         }
+
+        Err(match ep_addr {
+            Some(_) => UsbError::InvalidEndpoint,
+            None => UsbError::EndpointOverflow,
+        })
     }
 
     fn enable(&mut self) {}
