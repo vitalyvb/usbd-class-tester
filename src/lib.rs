@@ -25,16 +25,14 @@
 //! ### Supported operations
 //!
 //! * IN and OUT EP0 control transfers
+//! * Transfers on other endpoints (e.g. Interrupt)
 //!
 //! ### Not supported operations
 //!
 //! Almost everything else, including but not limited to:
 //!
-//! * Endpoints other than EP0 in `EmulatedUsbBus::poll()`
-//! * Endpoint allocation in `EmulatedUsbBus::alloc_ep()`
 //! * Reset
 //! * Suspend and Resume
-//! * Interrupt transfers
 //! * Bulk transfers
 //! * Iso transfers
 //! * ...
@@ -437,6 +435,8 @@ where
     /// Perform Endpoint Device-to-host data transfer
     /// on a given endpoint index `ep_index` of a
     /// maximum size `length`.
+    ///
+    /// Returns a Vec[u8] with data.
     pub fn ep_read(
         &mut self,
         cls: &mut C,
@@ -458,6 +458,9 @@ where
     /// Perform Endpoint Host-to-device data transfer
     /// on a given endpoint index `ep_index` and
     /// with `data`.
+    ///
+    /// Returns number of bytes that was loaded into
+    /// Endpoint buffer.
     pub fn ep_write(
         &mut self,
         cls: &mut C,
