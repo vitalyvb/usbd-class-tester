@@ -111,6 +111,7 @@ pub struct SetupPacket {
 }
 
 impl SetupPacket {
+    /// Create new SetupPacket
     pub fn new(reqt: CtrRequestType, req: u8, value: u16, index: u16, length: u16) -> Self {
         SetupPacket {
             bm_request_type: reqt,

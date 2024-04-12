@@ -1,4 +1,5 @@
 #![allow(clippy::test_attr_in_doctest)]
+#![warn(missing_docs)]
 //!
 //! A library for running tests of `usb-device` classes on
 //! developer's system natively.
@@ -87,11 +88,12 @@
 //!
 //! #[test]
 //! fn test_interface_get_status() {
-//!     with_usb(TestCtx {}, |mut cls, mut dev| {
-//!         let st = dev.interface_get_status(&mut cls, 0).expect("status");
-//!         assert_eq!(st, 0);
-//!     })
-//!     .expect("with_usb");
+//!     TestCtx {}
+//!         .with_usb(|mut cls, mut dev| {
+//!             let st = dev.interface_get_status(&mut cls, 0).expect("status");
+//!             assert_eq!(st, 0);
+//!         })
+//!         .expect("with_usb");
 //! }
 //! ```
 //!
@@ -113,6 +115,7 @@ use bus::*;
 mod usbdata;
 use usbdata::*;
 
+/// Prelude
 pub mod prelude {
     pub use crate::bus::EmulatedUsbBus;
     pub use crate::usbdata::{CtrRequestType, SetupPacket};
@@ -186,9 +189,15 @@ pub enum AnyUsbError {
     UserDefinedString(String),
 }
 
+/// Holds results for endpoint read/write operations
 #[derive(Debug, Default)]
 pub struct RWRes {
+    /// If there was a read operation returns number of data bytes
+    /// that were read.
     pub read: Option<usize>,
+    /// If there was a write operation returns number of data bytes
+    /// that were written.
+    /// Setup packet is not included.
     pub wrote: Option<usize>,
 }
 
@@ -198,6 +207,7 @@ impl RWRes {
     }
 }
 
+/// Result for crate operations.
 pub type AnyResult<T> = core::result::Result<T, AnyUsbError>;
 
 /// A context for the test, provides some
@@ -424,6 +434,9 @@ where
         self.ep_raw(d, 0, Some(&setup_bytes), data, out)
     }
 
+    /// Perform Endpoint Device-to-host data transfer
+    /// on a given endpoint index `ep_index` of a
+    /// maximum size `length`.
     pub fn ep_read(
         &mut self,
         cls: &mut C,
@@ -442,6 +455,9 @@ where
         }
     }
 
+    /// Perform Endpoint Host-to-device data transfer
+    /// on a given endpoint index `ep_index` and
+    /// with `data`.
     pub fn ep_write(
         &mut self,
         cls: &mut C,
