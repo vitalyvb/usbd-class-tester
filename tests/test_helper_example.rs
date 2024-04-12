@@ -13,7 +13,8 @@ use usb_device::bus::UsbBusAllocator;
 
 struct TestCtx {}
 
-impl UsbDeviceCtx<EmulatedUsbBus, TestUsbClass> for TestCtx {
+impl UsbDeviceCtx for TestCtx {
+    type C<'c> = TestUsbClass;
     fn create_class<'a>(
         &mut self,
         alloc: &'a UsbBusAllocator<EmulatedUsbBus>,
@@ -24,7 +25,8 @@ impl UsbDeviceCtx<EmulatedUsbBus, TestUsbClass> for TestCtx {
 
 #[test]
 fn test_custom_device_get_status_set_self_powered() {
-    with_usb(TestCtx {}, |mut cls, mut dev| {
+    TestCtx {}
+    .with_usb(|mut cls, mut dev| {
         dev.usb_dev().set_self_powered(true);
 
         let status = dev.device_get_status(&mut cls).expect("result");

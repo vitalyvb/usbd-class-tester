@@ -75,7 +75,8 @@
 //!
 //! // Context to create a testable instance of `TestUsbClass`
 //! struct TestCtx {}
-//! impl UsbDeviceCtx<EmulatedUsbBus, TestUsbClass> for TestCtx {
+//! impl UsbDeviceCtx for TestCtx {
+//!     type C<'c> = TestUsbClass;
 //!     fn create_class<'a>(
 //!         &mut self,
 //!         alloc: &'a UsbBusAllocator<EmulatedUsbBus>,
@@ -99,7 +100,7 @@ use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::{cell::RefCell, rc::Rc};
 
-use usb_device::bus::{UsbBus, UsbBusAllocator};
+use usb_device::bus::UsbBusAllocator;
 use usb_device::class::UsbClass;
 use usb_device::device::{StringDescriptors, UsbDevice, UsbDeviceBuilder, UsbVidPid};
 use usb_device::endpoint::EndpointAddress;
@@ -115,7 +116,7 @@ use usbdata::*;
 pub mod prelude {
     pub use crate::bus::EmulatedUsbBus;
     pub use crate::usbdata::{CtrRequestType, SetupPacket};
-    pub use crate::{with_usb, AnyResult, AnyUsbError, Device, UsbDeviceCtx};
+    pub use crate::{AnyResult, AnyUsbError, Device, UsbDeviceCtx};
 }
 
 const DEFAULT_EP0_SIZE: u8 = 8;
@@ -176,7 +177,16 @@ pub type AnyResult<T> = core::result::Result<T, AnyUsbError>;
 /// A context for the test, provides some
 /// configuration values, initialization,
 /// and some customization.
-pub trait UsbDeviceCtx<B: UsbBus, C: UsbClass<B>> {
+pub trait UsbDeviceCtx : Sized {
+    /// Class under the test.
+    /// # Examples
+    /// ```ignore
+    /// type C<'c> = SimpleUsbClass;
+    /// type C<'c> = ComplexUsbClass<'c, EmulatedUsbBus>;
+    /// ```
+
+    type C<'c> : UsbClass<EmulatedUsbBus> + 'c;
+
     /// EP0 size used by `build_usb_device()` when creating
     /// `UsbDevice`.
     ///
@@ -208,12 +218,12 @@ pub trait UsbDeviceCtx<B: UsbBus, C: UsbClass<B>> {
     /// }
     /// # }
     /// ```
-    fn create_class(&mut self, alloc: &UsbBusAllocator<B>) -> AnyResult<C>;
+    fn create_class<'a>(&mut self, alloc: &'a UsbBusAllocator<EmulatedUsbBus>) -> AnyResult<Self::C<'a>>;
 
     /// Optional. Called after each `usb-device` `poll()`.
     ///
     /// Default implementation does nothing.
-    fn post_poll(&mut self, _cls: &mut C) {}
+    fn post_poll(&mut self, _cls: &mut impl UsbClass<EmulatedUsbBus>) {}
 
     /// Optional. If returns `true`, `Device::setup()` is not
     /// called to initialize and enumerate device in
@@ -247,8 +257,8 @@ pub trait UsbDeviceCtx<B: UsbBus, C: UsbClass<B>> {
     /// ````
     fn build_usb_device<'a>(
         &mut self,
-        alloc: &'a UsbBusAllocator<B>,
-    ) -> AnyResult<UsbDevice<'a, B>> {
+        alloc: &'a UsbBusAllocator<EmulatedUsbBus>,
+    ) -> AnyResult<UsbDevice<'a, EmulatedUsbBus>> {
         let usb_dev = UsbDeviceBuilder::new(alloc, UsbVidPid(0x1234, 0x5678))
             .strings(&[StringDescriptors::default()
                 .manufacturer("TestManufacturer")
@@ -265,6 +275,74 @@ pub trait UsbDeviceCtx<B: UsbBus, C: UsbClass<B>> {
 
         Ok(usb_dev)
     }
+
+    /// Initialize USB device Class `C` according to the provided
+    /// context `X` and run `case()` on it.
+    ///
+    /// `case` will not be called if `with_usb` encounters a
+    /// problem during the setup, in this case `with_usb` returns
+    /// an error.
+    ///
+    /// # Example
+    /// ```
+    /// use usb_device::class_prelude::*;
+    /// use usbd_class_tester::prelude::*;
+    ///
+    /// pub struct TestUsbClass {}
+    /// impl<B: UsbBus> UsbClass<B> for TestUsbClass {}
+    ///
+    /// struct TestCtx {}
+    /// impl TestCtx {}
+    ///
+    /// impl UsbDeviceCtx for TestCtx {
+    ///     type C<'c> = TestUsbClass;
+    ///     fn create_class<'a>(
+    ///         &mut self,
+    ///         alloc: &'a UsbBusAllocator<EmulatedUsbBus>,
+    ///     ) -> AnyResult<TestUsbClass> {
+    ///         Ok(TestUsbClass {})
+    ///     }
+    /// }
+    ///
+    /// #[test]
+    /// fn test_interface_get_status() {
+    ///     with_usb(TestCtx {}, |mut cls, mut dev| {
+    ///         let st = dev.interface_get_status(&mut cls, 0).expect("status");
+    ///         assert_eq!(st, 0);
+    ///     })
+    ///     .expect("with_usb");
+    /// }
+    /// ```
+    ///
+    fn with_usb(mut self: Self, case: for <'a> fn(cls: Self::C<'a>, dev: Device<'a, Self::C<'a>, Self>)) -> AnyResult<()>
+    {
+        let stio: UsbBusImpl = UsbBusImpl::new();
+        let io = Rc::new(RefCell::new(stio));
+        let bus = EmulatedUsbBus::new(&io);
+    
+        let alloc: usb_device::bus::UsbBusAllocator<EmulatedUsbBus> = UsbBusAllocator::new(bus);
+    
+        let mut cls = self.create_class(&alloc)?;
+    
+        let mut usb_dev = self.build_usb_device(&alloc)?;
+    
+        let skip_setup = self.skip_setup();
+    
+        usb_dev.poll(&mut [&mut cls]);
+        self.post_poll(&mut cls);
+    
+        let mut dev = Device::new(io.as_ref(), self, usb_dev);
+    
+        if !skip_setup {
+            dev.setup(&mut cls)?;
+        }
+    
+        // run test
+        case(cls, dev);
+
+        Ok(())
+    }
+
 }
 
 /// Represents Host's view of the Device via
@@ -272,7 +350,7 @@ pub trait UsbDeviceCtx<B: UsbBus, C: UsbClass<B>> {
 pub struct Device<'a, C, X>
 where
     C: UsbClass<EmulatedUsbBus>,
-    X: UsbDeviceCtx<EmulatedUsbBus, C>,
+    X: UsbDeviceCtx<C<'a> = C>,
 {
     ctx: X,
     usb: &'a RefCell<UsbBusImpl>,
@@ -283,7 +361,7 @@ where
 impl<'a, C, X> Device<'a, C, X>
 where
     C: UsbClass<EmulatedUsbBus>,
-    X: UsbDeviceCtx<EmulatedUsbBus, C>,
+    X: UsbDeviceCtx<C<'a> = C>,
 {
     fn new(usb: &'a RefCell<UsbBusImpl>, ctx: X, dev: UsbDevice<'a, EmulatedUsbBus>) -> Self {
         Device {
@@ -829,70 +907,3 @@ where
     }
 }
 
-/// Initialize USB device Class `C` according to the provided
-/// context `X` and run `case()` on it.
-///
-/// `case` will not be called if `with_usb` encounters a
-/// problem during the setup, in this case `with_usb` returns
-/// an error.
-///
-/// # Example
-/// ```
-/// use usb_device::class_prelude::*;
-/// use usbd_class_tester::prelude::*;
-///
-/// pub struct TestUsbClass {}
-/// impl<B: UsbBus> UsbClass<B> for TestUsbClass {}
-///
-/// struct TestCtx {}
-/// impl TestCtx {}
-///
-/// impl UsbDeviceCtx<EmulatedUsbBus, TestUsbClass> for TestCtx {
-///     fn create_class<'a>(
-///         &mut self,
-///         alloc: &'a UsbBusAllocator<EmulatedUsbBus>,
-///     ) -> AnyResult<TestUsbClass> {
-///         Ok(TestUsbClass {})
-///     }
-/// }
-///
-/// #[test]
-/// fn test_interface_get_status() {
-///     with_usb(TestCtx {}, |mut cls, mut dev| {
-///         let st = dev.interface_get_status(&mut cls, 0).expect("status");
-///         assert_eq!(st, 0);
-///     })
-///     .expect("with_usb");
-/// }
-/// ```
-///
-pub fn with_usb<C, X>(mut ctx: X, case: for<'a> fn(cls: C, dev: Device<'a, C, X>)) -> AnyResult<()>
-where
-    C: UsbClass<EmulatedUsbBus>,
-    X: UsbDeviceCtx<EmulatedUsbBus, C>,
-{
-    let stio: UsbBusImpl = UsbBusImpl::new();
-    let io = Rc::new(RefCell::new(stio));
-    let bus = EmulatedUsbBus::new(&io);
-
-    let alloc: usb_device::bus::UsbBusAllocator<EmulatedUsbBus> = UsbBusAllocator::new(bus);
-
-    let mut cls = ctx.create_class(&alloc)?;
-
-    let mut usb_dev = ctx.build_usb_device(&alloc)?;
-
-    let skip_setup = ctx.skip_setup();
-
-    usb_dev.poll(&mut [&mut cls]);
-    ctx.post_poll(&mut cls);
-
-    let mut dev = Device::new(io.as_ref(), ctx, usb_dev);
-
-    if !skip_setup {
-        dev.setup(&mut cls)?;
-    }
-
-    // run test
-    case(cls, dev);
-    Ok(())
-}

@@ -23,7 +23,8 @@ impl TestCtx {
     }
 }
 
-impl UsbDeviceCtx<EmulatedUsbBus, TestUsbClass> for TestCtx {
+impl UsbDeviceCtx for TestCtx {
+    type C<'c> = TestUsbClass;
     const ADDRESS: u8 = 55;
 
     fn create_class<'a>(
@@ -40,7 +41,8 @@ impl UsbDeviceCtx<EmulatedUsbBus, TestUsbClass> for TestCtx {
 
 #[test]
 fn test_device_get_status_set_self_powered() {
-    with_usb(TestCtx::new(), |mut cls, mut dev| {
+    TestCtx::new()
+    .with_usb(|mut cls, mut dev| {
         dev.usb_dev().set_self_powered(true);
 
         let status = dev.device_get_status(&mut cls).expect("vec");
@@ -56,7 +58,8 @@ fn test_device_get_status_set_self_powered() {
 
 #[test]
 fn test_device_feature_remote_wakeup() {
-    with_usb(TestCtx::new(), |mut cls, mut dev| {
+    TestCtx::new()
+    .with_usb(|mut cls, mut dev| {
         dev.device_set_feature(&mut cls, 1).expect("failed");
         assert_eq!(dev.usb_dev().remote_wakeup_enabled(), true);
 
@@ -68,7 +71,8 @@ fn test_device_feature_remote_wakeup() {
 
 #[test]
 fn test_device_address_set() {
-    with_usb(TestCtx::new(), |mut _cls, mut dev| {
+    TestCtx::new()
+    .with_usb(|mut _cls, mut dev| {
         assert_eq!(dev.usb_dev().bus().get_address(), TestCtx::ADDRESS);
     })
     .expect("with_usb");
@@ -76,7 +80,8 @@ fn test_device_address_set() {
 
 #[test]
 fn test_device_configured() {
-    with_usb(TestCtx::new(), |mut _cls, mut dev| {
+    TestCtx::new()
+    .with_usb(|mut _cls, mut dev| {
         assert_eq!(dev.usb_dev().state(), UsbDeviceState::Configured);
     })
     .expect("with_usb");
@@ -84,7 +89,8 @@ fn test_device_configured() {
 
 #[test]
 fn test_device_set_address_and_configuration() {
-    with_usb(TestCtx::no_setup(), |mut cls, mut dev| {
+    TestCtx::no_setup()
+    .with_usb(|mut cls, mut dev| {
         let mut cnf;
 
         assert_eq!(dev.usb_dev().state(), UsbDeviceState::Default);
@@ -110,7 +116,8 @@ fn test_device_set_address_and_configuration() {
 
 #[test]
 fn test_device_get_descriptor_strings() {
-    with_usb(TestCtx::new(), |mut cls, mut dev| {
+    TestCtx::new()
+    .with_usb(|mut cls, mut dev| {
         let mut vec;
 
         let desc = |s: &str| {
@@ -143,7 +150,8 @@ fn test_device_get_descriptor_strings() {
 
 #[test]
 fn test_device_get_strings() {
-    with_usb(TestCtx::new(), |mut cls, mut dev| {
+    TestCtx::new()
+    .with_usb(|mut cls, mut dev| {
         let mut res;
 
         // get default string descriptors
@@ -161,7 +169,8 @@ fn test_device_get_strings() {
 
 #[test]
 fn test_interface_get_status() {
-    with_usb(TestCtx::new(), |mut cls, mut dev| {
+    TestCtx::new()
+    .with_usb(|mut cls, mut dev| {
         let st = dev.interface_get_status(&mut cls, 0).expect("status");
         assert_eq!(st, 0);
     })
@@ -170,7 +179,8 @@ fn test_interface_get_status() {
 
 #[test]
 fn test_interface_alt_interface() {
-    with_usb(TestCtx::new(), |mut cls, mut dev| {
+    TestCtx::new()
+    .with_usb(|mut cls, mut dev| {
         let st = dev
             .interface_get_interface(&mut cls)
             .expect("get_interface");
@@ -191,7 +201,8 @@ fn test_interface_alt_interface() {
 
 #[test]
 fn test_interface_get_set_feature() {
-    with_usb(TestCtx::new(), |mut cls, mut dev| {
+    TestCtx::new()
+    .with_usb(|mut cls, mut dev| {
         dev.interface_set_feature(&mut cls, 0, 1)
             .expect_err("interface feature");
         dev.interface_clear_feature(&mut cls, 0, 1)
@@ -202,7 +213,8 @@ fn test_interface_get_set_feature() {
 
 #[test]
 fn test_device_custom_control_command() {
-    with_usb(TestCtx::new(), |mut cls, mut dev| {
+    TestCtx::new()
+    .with_usb(|mut cls, mut dev| {
         let mut vec;
 
         vec = dev
@@ -262,7 +274,9 @@ impl<B: UsbBus> UsbClass<B> for FailTestUsbClass {}
 
 struct FailTestCtx {}
 
-impl UsbDeviceCtx<EmulatedUsbBus, FailTestUsbClass> for FailTestCtx {
+impl UsbDeviceCtx for FailTestCtx {
+    type C<'c> = FailTestUsbClass;
+    
     const ADDRESS: u8 = 55;
 
     fn create_class<'a>(
@@ -276,7 +290,8 @@ impl UsbDeviceCtx<EmulatedUsbBus, FailTestUsbClass> for FailTestCtx {
 #[test]
 #[should_panic(expected = "with_usb: UserDefined1")]
 fn test_create_class_fails() {
-    with_usb(FailTestCtx {}, |mut _cls, mut _dev| {
+    FailTestCtx {}
+    .with_usb(|mut _cls, mut _dev| {
         unreachable!("case should not run");
     })
     .expect("with_usb");
