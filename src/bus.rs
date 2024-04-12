@@ -127,7 +127,7 @@ impl UsbBusImpl {
         if setup && ep_addr.index() == 0 && ep_addr.direction() == UsbDirection::Out {
             // setup packet on EP0OUT removes stall condition
             ep.stall = false;
-            let mut ep0in = self.ep_i.get(0).unwrap().borrow_mut();
+            let mut ep0in = self.ep_i.get(ep_addr.index()).unwrap().borrow_mut();
             ep0in.stall = false;
         }
         ep.set_read(data, setup)

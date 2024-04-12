@@ -162,11 +162,12 @@ pub enum AnyUsbError {
     /// SET_ADDRESS didn't work during Device setup.
     /// Usually, this is some internal error.
     SetAddressFailed,
-    ///
+    /// Descriptor length is larger than the size
+    /// of data returned.
     InvalidDescriptorLength,
-    ///
+    /// Unexpected Descriptor type.
     InvalidDescriptorType,
-    ///
+    /// String Descriptor length is odd.
     InvalidStringLength,
     /// Wrapper for `BuilderError` of `usb-device`
     /// when `UsbDeviceBuilder` fails.
@@ -193,10 +194,7 @@ pub struct RWRes {
 
 impl RWRes {
     fn new(read: Option<usize>, wrote: Option<usize>) -> Self {
-        Self {
-            read: read,
-            wrote: wrote,
-        }
+        Self { read, wrote }
     }
 }
 
@@ -346,7 +344,7 @@ pub trait UsbDeviceCtx: Sized {
     /// ```
     ///
     fn with_usb(
-        mut self: Self,
+        mut self,
         case: for<'a> fn(cls: Self::C<'a>, dev: Device<'a, Self::C<'a>, Self>),
     ) -> AnyResult<()> {
         let stio: UsbBusImpl = UsbBusImpl::new();
@@ -504,8 +502,7 @@ where
             if self.usb.borrow().stalled(ep_index) {
                 return Err(AnyUsbError::EPStalled);
             }
-            dbg!("aaaaaaaaaaa", sent);
-        };
+        }
 
         let mut len = 0;
         let max_ep_size = self.usb.borrow().ep_max_size(in0);
@@ -519,7 +516,7 @@ where
             }
 
             len += one;
-            if one < max_ep_size as usize {
+            if one < max_ep_size {
                 // short read - last block
                 break;
             }
