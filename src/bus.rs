@@ -44,13 +44,25 @@ impl EndpointImpl {
     }
 
     /// Sets data that will be read by usb-device from the Endpoint
-    fn set_read(&mut self, data: &[u8], setup: bool) {
+    fn set_read(&mut self, data: &[u8], setup: bool) -> usize {
         self.read_len = data.len();
         if self.read_len > 0 {
             self.read[..self.read_len].clone_from_slice(data);
             self.setup = setup;
             self.read_ready = true;
         }
+        self.read_len
+    }
+
+    fn append_read(&mut self, data: &[u8]) -> usize {
+        let len = data.len();
+
+        if len > 0 {
+            self.read[self.read_len..self.read_len + len].clone_from_slice(data);
+            self.read_ready = true;
+            self.read_len += len;
+        }
+        len
     }
 
     /// Returns data that was written by usb-device to the Endpoint
@@ -110,7 +122,7 @@ impl UsbBusImpl {
         ep.get_write(data)
     }
 
-    pub(crate) fn set_read(&self, ep_addr: EndpointAddress, data: &[u8], setup: bool) {
+    pub(crate) fn set_read(&self, ep_addr: EndpointAddress, data: &[u8], setup: bool) -> usize {
         let mut ep = self.epidx(ep_addr).borrow_mut();
         if setup && ep_addr.index() == 0 && ep_addr.direction() == UsbDirection::Out {
             // setup packet on EP0OUT removes stall condition
@@ -121,17 +133,43 @@ impl UsbBusImpl {
         ep.set_read(data, setup)
     }
 
-    pub(crate) fn stalled0(&self) -> bool {
-        let in0 = EndpointAddress::from_parts(0, UsbDirection::In);
-        let out0 = EndpointAddress::from_parts(0, UsbDirection::Out);
+    pub(crate) fn append_read(&self, ep_addr: EndpointAddress, data: &[u8]) -> usize {
+        let mut ep = self.epidx(ep_addr).borrow_mut();
+        ep.append_read(data)
+    }
+
+    pub(crate) fn ep_max_size(&self, ep_addr: EndpointAddress) -> usize {
+        let ep = self.epidx(ep_addr).borrow();
+        ep.max_size
+    }
+
+    pub(crate) fn ep_is_empty(&self, ep_addr: EndpointAddress) -> bool {
+        let ep = self.epidx(ep_addr).borrow();
+        match ep_addr.direction() {
+            UsbDirection::In => ep.write_done,
+            UsbDirection::Out => ep.read_ready,
+        }
+    }
+
+    pub(crate) fn ep_data_len(&self, ep_addr: EndpointAddress) -> usize {
+        let ep = self.epidx(ep_addr).borrow();
+        match ep_addr.direction() {
+            UsbDirection::In => ep.write_len,
+            UsbDirection::Out => ep.read_len,
+        }
+    }
+
+    pub(crate) fn stalled(&self, index: usize) -> bool {
+        let addr_in = EndpointAddress::from_parts(index, UsbDirection::In);
+        let addr_out = EndpointAddress::from_parts(index, UsbDirection::Out);
         {
-            let ep = self.epidx(in0).borrow();
+            let ep = self.epidx(addr_in).borrow();
             if ep.stall {
                 return true;
             }
         }
         {
-            let ep = self.epidx(out0).borrow();
+            let ep = self.epidx(addr_out).borrow();
             if ep.stall {
                 return true;
             }
@@ -179,7 +217,10 @@ impl usb_device::bus::UsbBus for EmulatedUsbBus {
         max_packet_size: u16,
         _interval: u8,
     ) -> UsbDeviceResult<EndpointAddress> {
-        for index in ep_addr.map(|a| a.index()..a.index() + 1).unwrap_or(1..NUM_ENDPOINTS) {
+        for index in ep_addr
+            .map(|a| a.index()..a.index() + 1)
+            .unwrap_or(1..NUM_ENDPOINTS)
+        {
             let found_addr = EndpointAddress::from_parts(index, ep_dir);
             let io = self.bus_ref().borrow();
             let mut ep = io.epidx(found_addr).borrow_mut();
@@ -213,27 +254,38 @@ impl usb_device::bus::UsbBus for EmulatedUsbBus {
     }
 
     fn poll(&self) -> PollResult {
-        let in0 = EndpointAddress::from_parts(0, UsbDirection::In);
-        let out0 = EndpointAddress::from_parts(0, UsbDirection::Out);
+        let mut mask_in_complete = 0;
+        let mut mask_ep_out = 0;
+        let mut mask_ep_setup = 0;
 
-        let io = self.bus_ref().borrow();
-        let ep0out = io.epidx(out0).borrow();
-        let mut ep0in = io.epidx(in0).borrow_mut();
+        for index in 0..NUM_ENDPOINTS {
+            let addrin = EndpointAddress::from_parts(index, UsbDirection::In);
+            let addrout = EndpointAddress::from_parts(index, UsbDirection::Out);
+            let bit = 1 << index;
 
-        let ep0_write_done = ep0in.write_done;
-        let ep0_can_read = ep0out.read_ready | ep0in.read_ready;
-        let ep0_setup = ep0out.setup;
+            let io = self.bus_ref().borrow();
+            let ep_out = io.epidx(addrout).borrow();
+            let mut ep_in = io.epidx(addrin).borrow_mut();
 
-        ep0in.write_done = false;
-        // dbg!(ep0out.read_ready , ep0in.read_ready);
+            if ep_in.write_done {
+                mask_in_complete |= bit;
+            }
+            if ep_out.read_ready | ep_in.read_ready {
+                mask_ep_out |= bit;
+            }
+            if ep_out.setup {
+                mask_ep_setup |= bit;
+            }
 
-        dbg!(ep0_write_done, ep0_can_read, ep0_setup);
+            ep_in.write_done = false;
+        }
 
-        if ep0_write_done || ep0_can_read || ep0_setup {
+        // dbg!("WER", mask_in_complete, mask_ep_out, mask_ep_setup);
+        if mask_in_complete != 0 || mask_ep_out != 0 || mask_ep_setup != 0 {
             PollResult::Data {
-                ep_in_complete: if ep0_write_done { 1 } else { 0 },
-                ep_out: if ep0_can_read { 1 } else { 0 },
-                ep_setup: if ep0_setup { 1 } else { 0 },
+                ep_in_complete: mask_in_complete,
+                ep_out: mask_ep_out,
+                ep_setup: mask_ep_setup,
             }
         } else {
             PollResult::None

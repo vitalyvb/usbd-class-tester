@@ -26,19 +26,19 @@ impl UsbDeviceCtx for TestCtx {
 #[test]
 fn test_custom_device_get_status_set_self_powered() {
     TestCtx {}
-    .with_usb(|mut cls, mut dev| {
-        dev.usb_dev().set_self_powered(true);
+        .with_usb(|mut cls, mut dev| {
+            dev.usb_dev().set_self_powered(true);
 
-        let status = dev.device_get_status(&mut cls).expect("result");
-        assert_eq!(status, 1);
+            let status = dev.device_get_status(&mut cls).expect("result");
+            assert_eq!(status, 1);
 
-        let vec = dev.custom_get_status(&mut cls).expect("vec");
-        assert_eq!(vec, [1, 0]);
+            let vec = dev.custom_get_status(&mut cls).expect("vec");
+            assert_eq!(vec, [1, 0]);
 
-        dev.usb_dev().set_self_powered(false);
+            dev.usb_dev().set_self_powered(false);
 
-        let vec = dev.custom_get_status(&mut cls).expect("vec");
-        assert_eq!(vec, [0, 0]);
-    })
-    .expect("with_usb");
+            let vec = dev.custom_get_status(&mut cls).expect("vec");
+            assert_eq!(vec, [0, 0]);
+        })
+        .expect("with_usb");
 }

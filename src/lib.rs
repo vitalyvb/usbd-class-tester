@@ -126,14 +126,27 @@ const DEFAULT_ADDRESS: u8 = 5;
 /// conditions.
 #[derive(Debug, PartialEq)]
 pub enum AnyUsbError {
-    /// EP0 Stalled. Not necessarily an error,
-    /// the Device rejected EP0 transaction.
+    /// EP Stalled after Setup packet. Not
+    /// necessarily an error, the Device
+    /// rejected EP transaction.
     /// Next request should clear Stall for EP0.
     EP0Stalled,
-    /// Error while reading from EP0.
+    /// EP0 buffer is not empty after Setup
+    /// packet was consumed.
+    EP0NotEmptyAfterSetup,
+    /// Can't get how many bytes were written.
+    /// Usually, this is some internal error.
+    EPWriteError,
+    /// Can't get how many bytes were read.
+    /// Usually, this is some internal error.
+    EPReadError,
+    /// EP Stalled. Not necessarily an error,
+    /// the Device rejected EP transaction.
+    EPStalled,
+    /// Error while reading from the endpoint.
     /// No data or data limit reached.
     /// Usually, this is some internal error.
-    EP0ReadFailed,
+    EPReadFailed,
     /// Bad reply length for GET_STATUS control request.
     /// Length should be 2.
     /// Usually, this is some internal error.
@@ -172,12 +185,27 @@ pub enum AnyUsbError {
     UserDefinedString(String),
 }
 
+#[derive(Debug, Default)]
+pub struct RWRes {
+    pub read: Option<usize>,
+    pub wrote: Option<usize>,
+}
+
+impl RWRes {
+    fn new(read: Option<usize>, wrote: Option<usize>) -> Self {
+        Self {
+            read: read,
+            wrote: wrote,
+        }
+    }
+}
+
 pub type AnyResult<T> = core::result::Result<T, AnyUsbError>;
 
 /// A context for the test, provides some
 /// configuration values, initialization,
 /// and some customization.
-pub trait UsbDeviceCtx : Sized {
+pub trait UsbDeviceCtx: Sized {
     /// Class under the test.
     /// # Examples
     /// ```ignore
@@ -185,7 +213,7 @@ pub trait UsbDeviceCtx : Sized {
     /// type C<'c> = ComplexUsbClass<'c, EmulatedUsbBus>;
     /// ```
 
-    type C<'c> : UsbClass<EmulatedUsbBus> + 'c;
+    type C<'c>: UsbClass<EmulatedUsbBus> + 'c;
 
     /// EP0 size used by `build_usb_device()` when creating
     /// `UsbDevice`.
@@ -218,7 +246,10 @@ pub trait UsbDeviceCtx : Sized {
     /// }
     /// # }
     /// ```
-    fn create_class<'a>(&mut self, alloc: &'a UsbBusAllocator<EmulatedUsbBus>) -> AnyResult<Self::C<'a>>;
+    fn create_class<'a>(
+        &mut self,
+        alloc: &'a UsbBusAllocator<EmulatedUsbBus>,
+    ) -> AnyResult<Self::C<'a>>;
 
     /// Optional. Called after each `usb-device` `poll()`.
     ///
@@ -314,35 +345,36 @@ pub trait UsbDeviceCtx : Sized {
     /// }
     /// ```
     ///
-    fn with_usb(mut self: Self, case: for <'a> fn(cls: Self::C<'a>, dev: Device<'a, Self::C<'a>, Self>)) -> AnyResult<()>
-    {
+    fn with_usb(
+        mut self: Self,
+        case: for<'a> fn(cls: Self::C<'a>, dev: Device<'a, Self::C<'a>, Self>),
+    ) -> AnyResult<()> {
         let stio: UsbBusImpl = UsbBusImpl::new();
         let io = Rc::new(RefCell::new(stio));
         let bus = EmulatedUsbBus::new(&io);
-    
+
         let alloc: usb_device::bus::UsbBusAllocator<EmulatedUsbBus> = UsbBusAllocator::new(bus);
-    
+
         let mut cls = self.create_class(&alloc)?;
-    
+
         let mut usb_dev = self.build_usb_device(&alloc)?;
-    
+
         let skip_setup = self.skip_setup();
-    
+
         usb_dev.poll(&mut [&mut cls]);
         self.post_poll(&mut cls);
-    
+
         let mut dev = Device::new(io.as_ref(), self, usb_dev);
-    
+
         if !skip_setup {
             dev.setup(&mut cls)?;
         }
-    
+
         // run test
         case(cls, dev);
 
         Ok(())
     }
-
 }
 
 /// Represents Host's view of the Device via
@@ -389,9 +421,37 @@ where
         setup: SetupPacket,
         data: Option<&[u8]>,
         out: &mut [u8],
-    ) -> core::result::Result<usize, AnyUsbError> {
+    ) -> core::result::Result<RWRes, AnyUsbError> {
         let setup_bytes: [u8; 8] = setup.into();
-        self.ep0_raw(d, &setup_bytes, data, out)
+        self.ep_raw(d, 0, Some(&setup_bytes), data, out)
+    }
+
+    pub fn ep_read(
+        &mut self,
+        cls: &mut C,
+        ep_index: usize,
+        length: u16,
+    ) -> core::result::Result<Vec<u8>, AnyUsbError> {
+        let mut buf: Vec<u8> = vec![0; length as usize];
+
+        let len = self.ep_raw(cls, ep_index, None, None, buf.as_mut_slice())?;
+
+        if let Some(len) = len.read {
+            buf.truncate(len);
+            Ok(buf)
+        } else {
+            Err(AnyUsbError::EPReadError)
+        }
+    }
+
+    pub fn ep_write(
+        &mut self,
+        cls: &mut C,
+        ep_index: usize,
+        data: &[u8],
+    ) -> core::result::Result<usize, AnyUsbError> {
+        let len = self.ep_raw(cls, ep_index, None, Some(data), &mut [])?;
+        len.wrote.ok_or(AnyUsbError::EPWriteError)
     }
 
     /// Perform raw EP0 Control transfer. `setup_bytes` is a
@@ -400,58 +460,72 @@ where
     /// and Device can receive it as a payload. For Device-to-host
     /// transfers `data` should be `None` and `out` must have
     /// enough space to store the response.
-    pub fn ep0_raw(
+    pub fn ep_raw(
         &mut self,
         d: &mut C,
-        setup_bytes: &[u8],
+        ep_index: usize,
+        setup_bytes: Option<&[u8]>,
         data: Option<&[u8]>,
         out: &mut [u8],
-    ) -> core::result::Result<usize, AnyUsbError> {
-        let out0 = EndpointAddress::from_parts(0, UsbDirection::Out);
-        let in0 = EndpointAddress::from_parts(0, UsbDirection::In);
+    ) -> core::result::Result<RWRes, AnyUsbError> {
+        let mut sent = None;
+        let out0 = EndpointAddress::from_parts(ep_index, UsbDirection::Out);
+        let in0 = EndpointAddress::from_parts(ep_index, UsbDirection::In);
 
-        self.usb.borrow().set_read(out0, setup_bytes, true);
-        self.dev.poll(&mut [d]);
-        self.ctx.post_poll(d);
-        if self.usb.borrow().stalled0() {
-            return Err(AnyUsbError::EP0Stalled);
+        if let Some(setup_bytes) = setup_bytes {
+            self.usb.borrow().set_read(out0, setup_bytes, true);
+            self.dev.poll(&mut [d]);
+            self.ctx.post_poll(d);
+            if self.usb.borrow().stalled(ep_index) {
+                return Err(AnyUsbError::EP0Stalled);
+            }
+            if self.usb.borrow().ep_data_len(out0) != 0 {
+                return Err(AnyUsbError::EP0NotEmptyAfterSetup);
+            }
         }
 
         if let Some(val) = data {
-            self.usb.borrow().set_read(out0, val, false);
-            for i in 1..100 {
+            sent = Some(self.usb.borrow().append_read(out0, val));
+            for i in 1..129 {
                 let res = self.dev.poll(&mut [d]);
                 self.ctx.post_poll(d);
                 if !res {
+                    // class has no data to consume
                     break;
                 }
-                if i >= 99 {
-                    return Err(AnyUsbError::EP0ReadFailed);
+                if self.usb.borrow().ep_is_empty(out0) {
+                    // consumed all data
+                    break;
+                }
+                if i >= 128 {
+                    return Err(AnyUsbError::EPReadFailed);
                 }
             }
-            if self.usb.borrow().stalled0() {
-                return Err(AnyUsbError::EP0Stalled);
+            if self.usb.borrow().stalled(ep_index) {
+                return Err(AnyUsbError::EPStalled);
             }
+            dbg!("aaaaaaaaaaa", sent);
         };
 
         let mut len = 0;
+        let max_ep_size = self.usb.borrow().ep_max_size(in0);
 
         loop {
             let one = self.usb.borrow().get_write(in0, &mut out[len..]);
             self.dev.poll(&mut [d]);
             self.ctx.post_poll(d);
-            if self.usb.borrow().stalled0() {
-                return Err(AnyUsbError::EP0Stalled);
+            if self.usb.borrow().stalled(ep_index) {
+                return Err(AnyUsbError::EPStalled);
             }
 
             len += one;
-            if one < DEFAULT_EP0_SIZE as usize {
+            if one < max_ep_size as usize {
                 // short read - last block
                 break;
             }
         }
 
-        Ok(len)
+        Ok(RWRes::new(Some(len), sent))
     }
 
     /// Perform EP0 Control transfer.
@@ -476,8 +550,13 @@ where
         let setup = SetupPacket::new(reqt, req, value, index, length);
 
         let len = self.ep0(cls, setup, data, buf.as_mut_slice())?;
-        buf.truncate(len);
-        Ok(buf)
+
+        if let Some(len) = len.read {
+            buf.truncate(len);
+            Ok(buf)
+        } else {
+            Err(AnyUsbError::EPReadError)
+        }
     }
 
     /// Perform Device-to-host EP0 Control transfer.
@@ -906,4 +985,3 @@ where
         Ok(())
     }
 }
-
