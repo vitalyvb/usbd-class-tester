@@ -8,12 +8,12 @@ pub trait DeviceExt<T> {
     fn custom_get_status(&mut self, cls: &mut T) -> core::result::Result<Vec<u8>, AnyUsbError>;
 }
 
-impl<'a, T, M> DeviceExt<T> for Device<'a, T, M>
+impl<'a, C, M> DeviceExt<C> for Device<'a, C, M>
 where
-    T: UsbClass<EmulatedUsbBus>,
-    M: UsbDeviceCtx<EmulatedUsbBus, T>,
+    C: UsbClass<EmulatedUsbBus>,
+    M: UsbDeviceCtx<C<'a> = C>,
 {
-    fn custom_get_status(&mut self, cls: &mut T) -> core::result::Result<Vec<u8>, AnyUsbError> {
+    fn custom_get_status(&mut self, cls: &mut C) -> core::result::Result<Vec<u8>, AnyUsbError> {
         let res = self.device_get_status(cls)?;
         Ok(res.to_le_bytes().into())
     }

@@ -26,16 +26,14 @@ was done via plain `u8` arrays only.
 ### Supported operations
 
 * IN and OUT EP0 control transfers
+* Transfers on other endpoints (e.g. Interrupt)
 
 ### Not supported operations
 
 Almost everything else, including but not limited to:
 
-* Endpoints other than EP0 in `EmulatedUsbBus::poll()`
-* Endpoint allocation in `EmulatedUsbBus::alloc_ep()`
 * Reset
 * Suspend and Resume
-* Interrupt transfers
 * Bulk transfers
 * Iso transfers
 * ...
@@ -77,7 +75,8 @@ impl<B: UsbBus> UsbClass<B> for TestUsbClass {}
 
 // Context to create a testable instance of `TestUsbClass`
 struct TestCtx {}
-impl UsbDeviceCtx<EmulatedUsbBus, TestUsbClass> for TestCtx {
+impl UsbDeviceCtx for TestCtx {
+    type C<'c> = TestUsbClass;
     fn create_class<'a>(
         &mut self,
         alloc: &'a UsbBusAllocator<EmulatedUsbBus>,
@@ -88,11 +87,12 @@ impl UsbDeviceCtx<EmulatedUsbBus, TestUsbClass> for TestCtx {
 
 #[test]
 fn test_interface_get_status() {
-    with_usb(TestCtx {}, |mut cls, mut dev| {
-        let st = dev.interface_get_status(&mut cls, 0).expect("status");
-        assert_eq!(st, 0);
-    })
-    .expect("with_usb");
+    TestCtx {}
+        .with_usb(|mut cls, mut dev| {
+            let st = dev.interface_get_status(&mut cls, 0).expect("status");
+            assert_eq!(st, 0);
+        })
+        .expect("with_usb");
 }
 ```
 
