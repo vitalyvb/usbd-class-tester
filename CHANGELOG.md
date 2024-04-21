@@ -6,6 +6,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2024-04-22
+
+### Added
+- `initlog` feature
+- `UsbDeviceCtx::initialize` which initializes logging by
+default if `initlog` feature is enabled
+- `Device::poll` which allows calling `poll` from the test case
+
+### Fixed
+- Termination condition in `Device::ep_raw`. Data phase stops
+when `UsbClass` does not consume data from the endpoint buffer
+- Incorrect internal `UsbBusImpl::ep_is_empty` condition check
+
+### Changed
+- Significanlty improved logging
+- `UsbDeviceCtx::post_poll` renamed and changed to `UsbDeviceCtx::hook`
+
 ## [0.2.1] - 2024-04-13
 
 ### Fixed
@@ -27,7 +44,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 First version.
 
-[Unreleased]: https://github.com/vitalyvb/usbd-class-tester/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/vitalyvb/usbd-class-tester/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/vitalyvb/usbd-class-tester/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/vitalyvb/usbd-class-tester/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/vitalyvb/usbd-class-tester/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/vitalyvb/usbd-class-tester/releases/tag/v0.1.0

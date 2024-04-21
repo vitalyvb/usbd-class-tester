@@ -1,6 +1,6 @@
 [package]
 name = "usbd-class-tester"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 
 description = "Library for testing usb-device device classes."
@@ -13,5 +13,16 @@ exclude = [
     ".github",
 ]
 
+[features]
+default = ["initlog"]
+initlog = ["dep:env_logger"]
+
 [dependencies.usb-device]
 version = "0.3.2"
+
+[dependencies.log]
+version = "0.4"
+
+[dependencies.env_logger]
+version = "0.11"
+optional = true

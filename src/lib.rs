@@ -95,7 +95,11 @@
 //! }
 //! ```
 //!
+//! USB debug logging can be enabled, for example, by running tests with:
+//! `$ RUST_LOG=trace cargo test -- --nocapture`
+//!
 
+use log::{debug, info, warn};
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::{cell::RefCell, rc::Rc};
@@ -117,7 +121,7 @@ use usbdata::*;
 pub mod prelude {
     pub use crate::bus::EmulatedUsbBus;
     pub use crate::usbdata::{CtrRequestType, SetupPacket};
-    pub use crate::{AnyResult, AnyUsbError, Device, UsbDeviceCtx};
+    pub use crate::{AnyResult, AnyUsbError, Device, HookAction, HookWhen, UsbDeviceCtx};
 }
 
 const DEFAULT_EP0_SIZE: u8 = 8;
@@ -185,6 +189,39 @@ pub enum AnyUsbError {
     /// User-defined meaning
     /// Enum value is passed through, not used by the library.
     UserDefinedString(String),
+}
+
+/// Specifies why `Device::hook()` was called.
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum HookWhen {
+    /// After `poll()` from `with_usb()` after initialization
+    /// and before device setup.
+    InitIdle,
+    /// After `poll()` once Setup packet is sent during the transaction.
+    AfterSetup(EndpointAddress),
+    /// After `poll()` once some portion of data is sent to
+    /// the device.
+    DataOut(EndpointAddress),
+    /// After `poll()` once some portion of data is received from
+    /// the device.
+    DataIn(EndpointAddress),
+    /// After a manual `poll()` from `with_usb()`'s `case`.
+    ManualPoll,
+}
+
+/// Specifies what `Device::hook()`'s caller should
+/// do.
+#[derive(Debug, PartialEq, Eq, Default, Clone, Copy)]
+pub enum HookAction {
+    /// Proceed normally
+    #[default]
+    Default,
+    /// Force polling again.
+    ForcePoll,
+    /// Do not call `poll` again even if would
+    /// call it normally and act as if `poll`
+    /// returned `false`.
+    Stop,
 }
 
 /// Holds results for endpoint read/write operations
@@ -260,7 +297,28 @@ pub trait UsbDeviceCtx: Sized {
     /// Optional. Called after each `usb-device` `poll()`.
     ///
     /// Default implementation does nothing.
-    fn post_poll(&mut self, _cls: &mut impl UsbClass<EmulatedUsbBus>) {}
+    fn hook(&mut self, cls: &mut Self::C<'_>, when: HookWhen) -> HookAction {
+        let _ = cls;
+        let _ = when;
+        HookAction::Default
+    }
+
+    /// Optional. Called by `with_usb` every time.
+    ///
+    /// Default implementation initializes `env_logger` logging suitable
+    /// for tests with `debug` level if `initlog` feature is enabled.
+    ///
+    /// `trace` logging level can be enabled via environment variable:
+    /// `RUST_LOG=trace cargo test -- --nocapture`.
+    fn initialize(&mut self) {
+        #[cfg(feature = "initlog")]
+        let _ =
+            env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug"))
+                .is_test(true)
+                .format_target(false)
+                .format_timestamp(None)
+                .try_init();
+    }
 
     /// Optional. If returns `true`, `Device::setup()` is not
     /// called to initialize and enumerate device in
@@ -355,6 +413,10 @@ pub trait UsbDeviceCtx: Sized {
         mut self,
         case: for<'a> fn(cls: Self::C<'a>, dev: Device<'a, Self::C<'a>, Self>),
     ) -> AnyResult<()> {
+        self.initialize();
+
+        warn!("#### with_usb start");
+
         let stio: UsbBusImpl = UsbBusImpl::new();
         let io = Rc::new(RefCell::new(stio));
         let bus = EmulatedUsbBus::new(&io);
@@ -363,20 +425,21 @@ pub trait UsbDeviceCtx: Sized {
 
         let mut cls = self.create_class(&alloc)?;
 
-        let mut usb_dev = self.build_usb_device(&alloc)?;
+        let usb_dev = self.build_usb_device(&alloc)?;
 
         let skip_setup = self.skip_setup();
 
-        usb_dev.poll(&mut [&mut cls]);
-        self.post_poll(&mut cls);
-
         let mut dev = Device::new(io.as_ref(), self, usb_dev);
 
+        dev.do_poll(&mut cls, HookWhen::InitIdle);
+
         if !skip_setup {
+            warn!("#### with_usb device setup");
             dev.setup(&mut cls)?;
         }
 
         // run test
+        warn!("#### with_usb case");
         case(cls, dev);
 
         Ok(())
@@ -413,6 +476,31 @@ where
     /// Provides direct access to `EmulatedUsbBus`
     pub fn usb_dev(&mut self) -> &mut UsbDevice<'a, EmulatedUsbBus> {
         &mut self.dev
+    }
+
+    fn do_poll(&mut self, d: &mut C, when: HookWhen) -> bool {
+        let mut res;
+        loop {
+            res = self.dev.poll(&mut [d]);
+            match self.ctx.hook(d, when) {
+                HookAction::Default => return res,
+                HookAction::ForcePoll => continue,
+                HookAction::Stop => return false,
+            }
+        }
+    }
+
+    /// Call `usb-device` poll().
+    ///
+    /// Most `Device` operations call poll() automatically
+    /// and this is usually enough for smaller transfers.
+    ///
+    /// Must be called, for example, to gradually process
+    /// emulated endpoint's buffer if `UsbClass`` blocks and
+    /// is unable to process data until some action is
+    /// pefromed on it.
+    pub fn poll(&mut self, d: &mut C) -> bool {
+        self.do_poll(d, HookWhen::ManualPoll)
     }
 
     /// Perform EP0 Control transfer. `setup` is `SetupPacket`.
@@ -489,10 +577,11 @@ where
         let out0 = EndpointAddress::from_parts(ep_index, UsbDirection::Out);
         let in0 = EndpointAddress::from_parts(ep_index, UsbDirection::In);
 
+        info!("#### EP {} transaction", ep_index);
+
         if let Some(setup_bytes) = setup_bytes {
             self.usb.borrow().set_read(out0, setup_bytes, true);
-            self.dev.poll(&mut [d]);
-            self.ctx.post_poll(d);
+            self.do_poll(d, HookWhen::AfterSetup(out0));
             if self.usb.borrow().stalled(ep_index) {
                 return Err(AnyUsbError::EP0Stalled);
             }
@@ -504,14 +593,23 @@ where
         if let Some(val) = data {
             sent = Some(self.usb.borrow().append_read(out0, val));
             for i in 1..129 {
-                let res = self.dev.poll(&mut [d]);
-                self.ctx.post_poll(d);
+                let before_bytes = self.usb.borrow().ep_data_len(out0);
+                let res = self.do_poll(d, HookWhen::DataIn(out0));
+                let after_bytes = self.usb.borrow().ep_data_len(out0);
+
                 if !res {
-                    // class has no data to consume
+                    debug!("#### EP {} class has no data to consume", ep_index);
                     break;
                 }
                 if self.usb.borrow().ep_is_empty(out0) {
-                    // consumed all data
+                    debug!("#### EP {} consumed all data", ep_index);
+                    break;
+                }
+                if before_bytes == after_bytes {
+                    debug!(
+                        "#### EP {} poll didn't consume any data, have {} bytes",
+                        ep_index, after_bytes
+                    );
                     break;
                 }
                 if i >= 128 {
@@ -528,8 +626,7 @@ where
 
         loop {
             let one = self.usb.borrow().get_write(in0, &mut out[len..]);
-            self.dev.poll(&mut [d]);
-            self.ctx.post_poll(d);
+            self.do_poll(d, HookWhen::DataOut(in0));
             if self.usb.borrow().stalled(ep_index) {
                 return Err(AnyUsbError::EPStalled);
             }
