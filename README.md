@@ -96,3 +96,5 @@ fn test_interface_get_status() {
 }
 ```
 
+USB debug logging can be enabled, for example, by running tests with:
+`$ RUST_LOG=trace cargo test -- --nocapture`

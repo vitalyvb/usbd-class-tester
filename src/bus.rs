@@ -4,6 +4,7 @@
 //!
 //! This implementation is not complete and probably buggy.
 //!
+use log::{debug, info, trace};
 use std::{cell::RefCell, cmp::min, rc::Rc};
 
 use usb_device::bus::PollResult;
@@ -51,6 +52,13 @@ impl EndpointImpl {
             self.setup = setup;
             self.read_ready = true;
         }
+
+        debug!(
+            "EP : set data to read: {} bytes, setup: {}",
+            self.read_len, setup
+        );
+        trace!("EP : {} {:02x?}", if setup { "<==" } else { "<--" }, data);
+
         self.read_len
     }
 
@@ -62,16 +70,23 @@ impl EndpointImpl {
             self.read_ready = true;
             self.read_len += len;
         }
+
+        debug!("EP : append data to read: {}", len);
+        trace!("EP : <-+ {:02x?}", &data[..len]);
+
         len
     }
 
     /// Returns data that was written by usb-device to the Endpoint
     fn get_write(&mut self, data: &mut [u8]) -> usize {
         let res = self.write_len;
-        dbg!("g", self.write_len);
         self.write_len = 0;
         data[..res].clone_from_slice(&self.write[..res]);
         self.write_done = true;
+
+        debug!("EP : retrieve written data: {}", res);
+        trace!("EP : --> {:02x?}", &data[..res]);
+
         res
     }
 }
@@ -146,8 +161,8 @@ impl UsbBusImpl {
     pub(crate) fn ep_is_empty(&self, ep_addr: EndpointAddress) -> bool {
         let ep = self.epidx(ep_addr).borrow();
         match ep_addr.direction() {
-            UsbDirection::In => ep.write_done,
-            UsbDirection::Out => ep.read_ready,
+            UsbDirection::In => ep.write_len == 0,
+            UsbDirection::Out => ep.read_len == 0,
         }
     }
 
@@ -247,9 +262,12 @@ impl usb_device::bus::UsbBus for EmulatedUsbBus {
         })
     }
 
-    fn enable(&mut self) {}
+    fn enable(&mut self) {
+        info!("Bus: enable");
+    }
 
     fn force_reset(&self) -> UsbDeviceResult<()> {
+        info!("Bus: force reset not supported");
         Err(UsbError::Unsupported)
     }
 
@@ -280,7 +298,11 @@ impl usb_device::bus::UsbBus for EmulatedUsbBus {
             ep_in.write_done = false;
         }
 
-        // dbg!("WER", mask_in_complete, mask_ep_out, mask_ep_setup);
+        debug!(
+            "Bus: poll results: in: {:02x} out {:02x} setup {:02x}",
+            mask_in_complete, mask_ep_out, mask_ep_setup
+        );
+
         if mask_in_complete != 0 || mask_ep_out != 0 || mask_ep_setup != 0 {
             PollResult::Data {
                 ep_in_complete: mask_in_complete,
@@ -297,7 +319,13 @@ impl usb_device::bus::UsbBus for EmulatedUsbBus {
         let mut ep = io.epidx(ep_addr).borrow_mut();
         let len = min(buf.len(), min(ep.read_len, ep.max_size));
 
-        dbg!("read len from", buf.len(), len, ep_addr);
+        debug!(
+            "Bus: reading from EP {} {:#?} {} bytes into {} byte buffer",
+            ep_addr.index(),
+            ep_addr.direction(),
+            len,
+            buf.len()
+        );
 
         if len == 0 {
             return Err(UsbError::WouldBlock);
@@ -318,18 +346,22 @@ impl usb_device::bus::UsbBus for EmulatedUsbBus {
     }
 
     fn reset(&self) {
+        info!("Bus: reset");
         todo!()
     }
 
     fn resume(&self) {
+        info!("Bus: resume");
         todo!()
     }
 
     fn suspend(&self) {
+        info!("Bus: suspend");
         todo!()
     }
 
     fn set_device_address(&self, addr: u8) {
+        debug!("Bus: set device address: {}", addr);
         self.usb_address.replace(addr);
     }
 
@@ -351,9 +383,12 @@ impl usb_device::bus::UsbBus for EmulatedUsbBus {
         let offset = ep.write_len;
         let mut len = 0;
 
-        dbg!("write", buf.len());
-
         if buf.len() > ep.max_size {
+            debug!(
+                "Bus: EP {} {:#?} buffer overflow",
+                ep_addr.index(),
+                ep_addr.direction()
+            );
             return Err(UsbError::BufferOverflow);
         }
 
@@ -365,7 +400,13 @@ impl usb_device::bus::UsbBus for EmulatedUsbBus {
             len += 1;
         }
 
-        dbg!("wrote", len);
+        debug!(
+            "Bus: wrote to EP {} {:#?} {} bytes",
+            ep_addr.index(),
+            ep_addr.direction(),
+            len
+        );
+
         ep.write_len += len;
         ep.write_done = false;
         Ok(len)
