@@ -17,6 +17,17 @@ protocols in USB devices which are based on `usb-device`
 crate by providing a means of simulating Host's accesses
 to the device.
 
+The diagram below gives an idea how different components
+relate to each other. `UsbClass` works with `usb-device`
+as usual. The test case can call `UsbClass`' functions
+if necessary. `usbd-class-tester` tries to emulate USB
+Host behavior and work with `UsbClass`, as the Host would
+do, via `usb-device`'s `UsbBus`. The test case calls
+`Device` functions to interact with `UsbClass` -
+perform control transfers or send and receive data.
+
+![Class and usage diagram](usb-class-tester.png)
+
 Initial implementation was done for tests in `usbd-dfu`
 crate. This library is based on that idea, but extends
 it a lot. For example it adds a set of convenience
